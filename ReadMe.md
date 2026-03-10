@@ -14,16 +14,17 @@ Un script Python pour automatiser l'ajout de clients (Peers) à un serveur WireG
    └── wg0.conf      # Configuration de l'interface
 
 2. **Dépendances système** : Le script a besoin de Python 3 et de qrencode pour l'affichage terminal.
-```sh
-sudo apt update
-sudo apt install wireguard-tools qrencode -y
-```
-Editer `nano /etc/sysctl.conf`
-```sh
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-```
-`sudo sysctl -p`
+   ```sh
+   sudo apt update
+   sudo apt install wireguard-tools qrencode -y
+   ```
+   
+   Editer `nano /etc/sysctl.conf`
+   ```sh
+   net.ipv4.ip_forward=1
+   net.ipv6.conf.all.forwarding=1
+   ```
+   `sudo sysctl -p`
 
 ## 💻 Utilisation
 
