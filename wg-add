@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import re
+import urllib.request
+import tempfile
+
+# --- CONFIGURATION ---
+WG_DIR = "/etc/wireguard"
+WG_INTERFACE = "wg0"
+WG_CONFIG = os.path.join(WG_DIR, f"{WG_INTERFACE}.conf")
+CLIENT_DNS = "8.8.8.8, 8.8.4.4"
+PORT = "51820"
+SERVER_IP="xxxx" # Pas necessaire, retrouve l'ip (automatiquement)
+
+# --- VERIFICATIONS PRELIMINAIRES ---
+if os.geteuid() != 0:
+    print("❌ Erreur : Ce script doit être lancé avec sudo !")
+    sys.exit(1)
+
+if len(sys.argv) < 2:
+    print(f"Usage: sudo {sys.argv[0]} <nom_client1> [<nom_client2> ...]")
+    sys.exit(1)
+
+if not os.path.exists(WG_CONFIG):
+    print(f"❌ Erreur : Le fichier {WG_CONFIG} n'existe pas.")
+    sys.exit(1)
+
+# --- FONCTION : DETECTER LE RESEAU DU SERVEUR ---
+def get_subnet_prefix(config_path):
+    try:
+        with open(config_path, 'r') as f:
+            content = f.read()
+        match = re.search(r"Address\s*=\s*(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d+", content)
+        if match:
+            return match.group(1) 
+    except Exception as e:
+        print(f"Erreur lecture config: {e}")
+    return None
+
+# --- INITIALISATION DU RESEAU ---
+SUBNET_PREFIX = get_subnet_prefix(WG_CONFIG)
+
+if not SUBNET_PREFIX:
+    print("❌ Impossible de détecter l'Address IP dans wg0.conf !")
+    sys.exit(1)
+else:
+    print(f"✅ Réseau détecté : {SUBNET_PREFIX}.x")
+
+# --- RECUPERATION IP PUBLIQUE ---
+print("🔍 Détection de l'IP publique et des clés...")
+try:
+    with urllib.request.urlopen('https://api.ipify.org', timeout=5) as response:
+        SERVER_IP = response.read().decode('utf-8')
+    SERVER_ENDPOINT = f"{SERVER_IP}:{PORT}"
+except:
+    print("⚠️ Impossible de détecter l'IP publique automatiquement.")
+    SERVER_IP = input("Entrez l'IP publique du serveur : ").strip()
+    SERVER_ENDPOINT = f"{SERVER_IP}:{PORT}"
+
+# --- LECTURE CLE PUBLIQUE SERVEUR ---
+server_pub_path = os.path.join(WG_DIR, "publickey")
+if os.path.exists(server_pub_path):
+    with open(server_pub_path) as f:
+        SERVER_PUB_KEY = f.read().strip()
+else:
+    # Tentative de récupération depuis wg0.conf si le fichier publickey n'existe pas
+    print(f"⚠️ Fichier {server_pub_path} introuvable. On essaie de déduire la clé...")
+    try:
+        priv_key = subprocess.check_output(f"wg show {WG_INTERFACE} private-key", shell=True).decode().strip()
+        SERVER_PUB_KEY = subprocess.check_output(["wg", "pubkey"], input=priv_key.encode()).decode().strip()
+    except:
+        print("❌ Erreur: Impossible de trouver la clé publique serveur.")
+        sys.exit(1)
+
+# --- TRAITEMENT DES CLIENTS ---
+client_names = sys.argv[1:]
+clients_dir = "./clients_configs"
+os.makedirs(clients_dir, exist_ok=True)
+new_peers_block = ""
+
+current_used_ips = set()
+with open(WG_CONFIG, 'r') as f:
+     matches = re.findall(rf"{re.escape(SUBNET_PREFIX)}\.(\d+)", f.read())
+     for m in matches: current_used_ips.add(int(m))
+
+for client_name in client_names:
+    print(f"\nTraitement de : {client_name}")
+    
+    octet_final = 0
+    for i in range(2, 255):
+        if i not in current_used_ips:
+            octet_final = i
+            current_used_ips.add(i)
+            break
+    
+    if octet_final == 0:
+        print("❌ Plus d'IP disponible pour ce client.")
+        break
+
+    client_ip = f"{SUBNET_PREFIX}.{octet_final}/32"
+
+    # Chemins
+    c_dir = os.path.join(clients_dir, client_name)
+    os.makedirs(c_dir, exist_ok=True)
+    key_priv_path = os.path.join(c_dir, "privatekey")
+    key_pub_path = os.path.join(c_dir, "publickey")
+    # Génération Clés
+    if not os.path.exists(key_priv_path):
+        priv = subprocess.check_output(["wg", "genkey"]).decode().strip()
+        with open(key_priv_path, "w") as f: f.write(priv)
+        os.chmod(key_priv_path, 0o600)
+    else:
+        with open(key_priv_path) as f: priv = f.read().strip()
+
+    if not os.path.exists(key_pub_path):
+        pub = subprocess.check_output(["wg", "pubkey"], input=priv.encode()).decode().strip()
+        with open(key_pub_path, "w") as f: f.write(pub)
+    else:
+        with open(key_pub_path) as f: pub = f.read().strip()
+
+    # Config Client
+    client_conf = f"""[Interface]
+PrivateKey = {priv}
+Address = {client_ip}
+DNS = {CLIENT_DNS}
+
+[Peer]
+PublicKey = {SERVER_PUB_KEY}
+Endpoint = {SERVER_ENDPOINT}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+"""
+    final_conf_path = f"{client_name}.conf"
+    with open(final_conf_path, "w") as f:
+        f.write(client_conf)
+
+    new_peers_block += f"""
+### Client: {client_name}
+[Peer]
+PublicKey = {pub}
+AllowedIPs = {client_ip}
+"""
+    print(f"✅ Config générée : {final_conf_path} (IP: {client_ip})")
+
+    # QR CODE
+    print(f"📱 QR Code pour {client_name} :")
+    try:
+        subprocess.run(["qrencode", "-t", "ansiutf8"], input=client_conf.encode(), check=True)
+    except FileNotFoundError:
+        print("⚠️  'qrencode' manquant.")
+    except Exception:
+        pass
+
+# --- ECRITURE ET MISE A JOUR ---
+if new_peers_block:
+    print("\n💾 Ajout des clients au fichier serveur wg0.conf...")
+    
+    # Lecture pour vérifier s'il faut ajouter un saut de ligne
+    with open(WG_CONFIG, "r") as f:
+        current_content = f.read()
+    
+    with open(WG_CONFIG, "a") as f:
+        # Si le fichier ne finit pas par un saut de ligne, on en ajoute un
+        if current_content and not current_content.endswith("\n"):
+            f.write("\n")
+        f.write(new_peers_block)
+    
+    print("\n🔄 Synchronisation de la configuration WireGuard...")
+    
+    # MÉTHODE SÛRE : syncconf
+    # Cela met à jour l'interface sans la redémarrer et sans écraser le fichier
+    try:
+        # On crée un fichier temporaire avec la config "stripped" (sans PostUp/Down, etc)
+        # car syncconf a besoin d'un fichier valide
+        subprocess.run(f"wg-quick strip {WG_INTERFACE} > /tmp/wg_strip_temp.conf", shell=True, check=True)
+        subprocess.run(f"wg syncconf {WG_INTERFACE} /tmp/wg_strip_temp.conf", shell=True, check=True)
+        os.remove("/tmp/wg_strip_temp.conf")
+        
+        print("✅ Configuration appliquée avec succès (sans coupure) !")
+        subprocess.run(["wg", "show", WG_INTERFACE])
+        
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Erreur lors du rechargement : {e}")
+        print("Essayez de lancer manuellement : wg-quick down wg0 && wg-quick up wg0")
+
+print("Terminé.")
